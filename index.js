@@ -159,11 +159,15 @@ async function handleMessage(client, customerPhone, userText) {
     // ✅ Supports BOTH trigger words — works for all business types
     const isComplete =
       botReply.includes('[ORDER_COMPLETE]') ||
-      botReply.includes('[LEAD_CAPTURED]');
-
+      botReply.includes('[LEAD_CAPTURED]') ||
+      botReply.includes('ORDER_COMPLETE') ||
+      botReply.includes('LEAD_CAPTURED');
+    
     const cleanReply = botReply
       .replace('[ORDER_COMPLETE]', '')
       .replace('[LEAD_CAPTURED]', '')
+      .replace('ORDER_COMPLETE', '')
+      .replace('LEAD_CAPTURED', '')
       .trim();
 
     await sendMessage(client.phoneNumberId, client.wabaToken, customerPhone, cleanReply);
