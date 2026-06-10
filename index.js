@@ -13,17 +13,27 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 // ============================================================
 // LOAD CLIENTS
 // Secrets come from Render environment variables
-// Only prompt + business name stored in GitHub JSON files
+// Only prompt + business name + bypass numbers stored in files
+// Supports both .json and .js client files
 // ============================================================
 function loadClients() {
   const clientsDir = path.join(__dirname, 'clients');
-  const files = fs.readdirSync(clientsDir).filter(f => f.endsWith('.json'));
+  const files = fs.readdirSync(clientsDir)
+    .filter(f => f.endsWith('.json') || f.endsWith('.js'));
   const clients = {};
 
   files.forEach(file => {
-    const config = JSON.parse(
-      fs.readFileSync(path.join(clientsDir, file), 'utf8')
-    );
+    let config;
+
+    if (file.endsWith('.js')) {
+      // Clear cache so changes take effect on reload
+      delete require.cache[require.resolve(path.join(clientsDir, file))];
+      config = require(path.join(clientsDir, file));
+    } else {
+      config = JSON.parse(
+        fs.readFileSync(path.join(clientsDir, file), 'utf8')
+      );
+    }
 
     const prefix = config.envPrefix;
 
@@ -37,9 +47,10 @@ function loadClients() {
     }
 
     clients[phoneNumberId] = {
-      businessName: config.businessName,
-      envPrefix:    prefix,
-      systemPrompt: config.systemPrompt,
+      businessName:  config.businessName,
+      envPrefix:     prefix,
+      systemPrompt:  config.systemPrompt,
+      bypassNumbers: config.bypassNumbers || [],
       phoneNumberId,
       wabaToken,
       ownerPhone,
@@ -53,7 +64,7 @@ function loadClients() {
 
 let CLIENTS = loadClients();
 
-// Reload clients without restarting
+// Reload clients without restarting server
 app.get('/reload-clients', (req, res) => {
   CLIENTS = loadClients();
   res.json({
@@ -61,6 +72,16 @@ app.get('/reload-clients', (req, res) => {
     loaded: Object.values(CLIENTS).map(c => c.businessName),
   });
 });
+
+// ============================================================
+// BOT ON/OFF STATE — per client (in memory)
+// ============================================================
+const botState = {}; // { phoneNumberId: true/false }
+
+function isBotActive(phoneNumberId) {
+  if (botState[phoneNumberId] === undefined) return true; // default ON
+  return botState[phoneNumberId];
+}
 
 // ============================================================
 // SESSION STORE
@@ -107,7 +128,7 @@ async function sendMessage(phoneNumberId, wabaToken, to, text) {
 }
 
 // ============================================================
-// NOTIFY OWNER — full conversation brief like old code
+// NOTIFY OWNER
 // ============================================================
 async function notifyOwner(client, customerPhone, messages) {
   const recentChat = messages
@@ -126,8 +147,81 @@ async function notifyOwner(client, customerPhone, messages) {
 }
 
 // ============================================================
+// OWNER ADMIN COMMANDS
+// Owner texts these from their personal number to bot number
+// ============================================================
+async function handleOwnerCommand(client, text) {
+  const cmd  = text.trim().toLowerCase();
+  const pid  = client.phoneNumberId;
+  const tok  = client.wabaToken;
+  const owner = client.ownerPhone;
+
+  // !on — turn bot ON
+  if (cmd === '!on') {
+    botState[pid] = true;
+    await sendMessage(pid, tok, owner,
+      `🟢 Bot is now ON for ${client.businessName}.\nCustomers will receive bot replies.`);
+
+  // !off — turn bot OFF
+  } else if (cmd === '!off') {
+    botState[pid] = false;
+    await sendMessage(pid, tok, owner,
+      `🔴 Bot is now OFF for ${client.businessName}.\nCustomers will get no reply until you turn it back on.`);
+
+  // !status — check current state
+  } else if (cmd === '!status') {
+    const status  = isBotActive(pid) ? '🟢 ON' : '🔴 OFF';
+    const bypassed = client.bypassNumbers.length > 0
+      ? client.bypassNumbers.join(', ')
+      : 'None';
+    await sendMessage(pid, tok, owner,
+      `📊 *Bot Status — ${client.businessName}*\n\n` +
+      `Status: ${status}\n` +
+      `Bypassed numbers: ${bypassed}`);
+
+  // !reply NUMBER message — send manual message to customer
+  } else if (text.trim().toLowerCase().startsWith('!reply ')) {
+    const parts = text.trim().split(' ');
+    const customerNumber = parts[1];
+    const messageText    = parts.slice(2).join(' ');
+
+    if (!customerNumber || !messageText) {
+      await sendMessage(pid, tok, owner,
+        `⚠️ Wrong format. Use:\n!reply 919XXXXXXXXX your message here`);
+      return;
+    }
+
+    await sendMessage(pid, tok, customerNumber, messageText);
+
+    // Save owner reply in session so bot has context later
+    const session = getSession(pid, customerNumber);
+    session.messages.push({
+      role: 'assistant',
+      content: `[Owner replied]: ${messageText}`
+    });
+
+    await sendMessage(pid, tok, owner,
+      `✅ Message sent to +${customerNumber}`);
+
+  // !help — show all commands
+  } else if (cmd === '!help') {
+    await sendMessage(pid, tok, owner,
+      `📋 *Available Commands:*\n\n` +
+      `!on → Turn bot ON\n` +
+      `!off → Turn bot OFF\n` +
+      `!status → Check bot status\n` +
+      `!reply 91XXXXXXXXXX message → Send message to customer\n` +
+      `!help → Show this list`);
+
+  // Unknown command
+  } else {
+    await sendMessage(pid, tok, owner,
+      `❓ Unknown command. Type *!help* to see all commands.`);
+  }
+}
+
+// ============================================================
 // HANDLE MESSAGE
-// Supports both [ORDER_COMPLETE] and [LEAD_CAPTURED] triggers
 // ============================================================
 async function handleMessage(client, customerPhone, userText) {
   const session = getSession(client.phoneNumberId, customerPhone);
@@ -156,13 +250,13 @@ async function handleMessage(client, customerPhone, userText) {
     const botReply = response.choices[0].message.content;
     session.messages.push({ role: 'assistant', content: botReply });
 
-    // ✅ Supports BOTH trigger words — works for all business types
+    // Supports both trigger words with and without brackets
     const isComplete =
       botReply.includes('[ORDER_COMPLETE]') ||
-      botReply.includes('[LEAD_CAPTURED]') ||
-      botReply.includes('ORDER_COMPLETE') ||
+      botReply.includes('[LEAD_CAPTURED]')  ||
+      botReply.includes('ORDER_COMPLETE')   ||
       botReply.includes('LEAD_CAPTURED');
-    
+
     const cleanReply = botReply
       .replace('[ORDER_COMPLETE]', '')
       .replace('[LEAD_CAPTURED]', '')
@@ -232,6 +326,25 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // ✅ Owner sending admin commands from personal number
+    if (from === client.ownerPhone && userText.startsWith('!')) {
+      console.log(`🔧 [${client.businessName}] Owner command: ${userText}`);
+      await handleOwnerCommand(client, userText);
+      return;
+    }
+
+    // ✅ Per-client bypass list — personal/family numbers
+    if (client.bypassNumbers.includes(from)) {
+      console.log(`⏭️ [${client.businessName}] Bypassed: +${from}`);
+      return;
+    }
+
+    // ✅ Check if bot is active for this client
+    if (!isBotActive(phoneNumberId)) {
+      console.log(`⛔ [${client.businessName}] Bot is OFF — message from +${from} ignored`);
+      return;
+    }
+
     console.log(`📩 [${client.businessName}] From +${from}: ${userText}`);
     await handleMessage(client, from, userText);
 
@@ -244,8 +357,10 @@ app.post('/webhook', async (req, res) => {
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => {
-  const list = Object.values(CLIENTS).map(c => c.businessName).join(', ') || 'No clients loaded';
-  res.send(`✅ Whatbot Running!\nLoaded clients: ${list}`);
+  const list = Object.values(CLIENTS)
+    .map(c => `${isBotActive(c.phoneNumberId) ? '🟢' : '🔴'} ${c.businessName}`)
+    .join('\n') || 'No clients loaded';
+  res.send(`<pre>✅ Whatbot Running!\n\nClients:\n${list}</pre>`);
 });
 
 const PORT = process.env.PORT || 3000;
