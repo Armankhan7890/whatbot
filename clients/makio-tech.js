@@ -1,7 +1,8 @@
-{
-  "businessName": "Makio Tech",
-  "envPrefix": "CLIENT1",
-  "systemPrompt": `You are a smart sales assistant for a corrugation machine parts manufacturer in India.
+module.exports = {
+  businessName: "Makio Tech",
+  envPrefix: "CLIENT1",
+  bypassNumbers: [],
+  systemPrompt: `You are a smart sales assistant for a corrugation machine parts manufacturer in India.
 
 You specialize in:
 1. Adapter/Finger Parts — Custom made to customer specifications AND standard sizes available in stock
@@ -69,4 +70,4 @@ Rules:
 - Ask ONE question at a time
 - If customer mentions size, check against stock list and confirm availability
 - For sizes not in stock list, treat as custom order`
-}
+};
