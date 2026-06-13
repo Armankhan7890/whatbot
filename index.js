@@ -128,6 +128,43 @@ async function sendMessage(phoneNumberId, wabaToken, to, text) {
 }
 
 // ============================================================
+// FORWARD MEDIA (image/document) TO OWNER
+// Lets the owner see exactly what the customer sent
+// ============================================================
+async function forwardMediaToOwner(client, customerPhone, mediaId, mediaType) {
+  try {
+    // Step 1: Send a small text heads-up first (so owner knows context)
+    await sendMessage(
+      client.phoneNumberId,
+      client.wabaToken,
+      client.ownerPhone,
+      `📎 *${client.businessName}* — Customer +${customerPhone} sent a ${mediaType}:`
+    );
+
+    // Step 2: Forward the actual media using the same media ID
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${client.phoneNumberId}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: client.ownerPhone,
+        type: mediaType, // 'image' or 'document'
+        [mediaType]: { id: mediaId },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${client.wabaToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    console.log(`📤 [${client.businessName}] Forwarded ${mediaType} from +${customerPhone} to owner`);
+  } catch (err) {
+    console.error(`❌ Media forward error [${client.businessName}]:`, err.response?.data || err.message);
+  }
+}
+
+// ============================================================
 // NOTIFY OWNER
 // ============================================================
 async function notifyOwner(client, customerPhone, messages) {
@@ -320,8 +357,14 @@ app.post('/webhook', async (req, res) => {
 
     if (message.type === 'text') {
       userText = message.text.body;
+
     } else if (message.type === 'image' || message.type === 'document') {
-      userText = 'Customer sent an image or document.';
+      userText = `Customer sent a ${message.type}.`;
+
+      // Forward the actual file to owner for review (security)
+      const mediaId = message[message.type].id;
+      await forwardMediaToOwner(client, from, mediaId, message.type);
+
     } else {
       return;
     }
