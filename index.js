@@ -4,6 +4,7 @@ const axios = require('axios');
 const Groq = require('groq-sdk');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const app = express();
 app.use(express.json());
@@ -26,7 +27,6 @@ function loadClients() {
     let config;
 
     if (file.endsWith('.js')) {
-      // Clear cache so changes take effect on reload
       delete require.cache[require.resolve(path.join(clientsDir, file))];
       config = require(path.join(clientsDir, file));
     } else {
@@ -64,7 +64,6 @@ function loadClients() {
 
 let CLIENTS = loadClients();
 
-// Reload clients without restarting server
 app.get('/reload-clients', (req, res) => {
   CLIENTS = loadClients();
   res.json({
@@ -76,10 +75,10 @@ app.get('/reload-clients', (req, res) => {
 // ============================================================
 // BOT ON/OFF STATE — per client (in memory)
 // ============================================================
-const botState = {}; // { phoneNumberId: true/false }
+const botState = {};
 
 function isBotActive(phoneNumberId) {
-  if (botState[phoneNumberId] === undefined) return true; // default ON
+  if (botState[phoneNumberId] === undefined) return true;
   return botState[phoneNumberId];
 }
 
@@ -129,11 +128,9 @@ async function sendMessage(phoneNumberId, wabaToken, to, text) {
 
 // ============================================================
 // FORWARD MEDIA (image/document) TO OWNER
-// Lets the owner see exactly what the customer sent
 // ============================================================
 async function forwardMediaToOwner(client, customerPhone, mediaId, mediaType) {
   try {
-    // Step 1: Send a small text heads-up first (so owner knows context)
     await sendMessage(
       client.phoneNumberId,
       client.wabaToken,
@@ -141,13 +138,12 @@ async function forwardMediaToOwner(client, customerPhone, mediaId, mediaType) {
       `📎 *${client.businessName}* — Customer +${customerPhone} sent a ${mediaType}:`
     );
 
-    // Step 2: Forward the actual media using the same media ID
     await axios.post(
       `https://graph.facebook.com/v18.0/${client.phoneNumberId}/messages`,
       {
         messaging_product: 'whatsapp',
         to: client.ownerPhone,
-        type: mediaType, // 'image' or 'document'
+        type: mediaType,
         [mediaType]: { id: mediaId },
       },
       {
@@ -161,6 +157,49 @@ async function forwardMediaToOwner(client, customerPhone, mediaId, mediaType) {
     console.log(`📤 [${client.businessName}] Forwarded ${mediaType} from +${customerPhone} to owner`);
   } catch (err) {
     console.error(`❌ Media forward error [${client.businessName}]:`, err.response?.data || err.message);
+  }
+}
+
+// ============================================================
+// DOWNLOAD MEDIA FROM META AND TRANSCRIBE WITH GROQ WHISPER
+// Returns the transcribed text from a voice note
+// ============================================================
+async function transcribeAudio(client, mediaId) {
+  let tempFilePath;
+  try {
+    // Step 1: Get the temporary media URL from Meta
+    const mediaInfo = await axios.get(
+      `https://graph.facebook.com/v18.0/${mediaId}`,
+      { headers: { Authorization: `Bearer ${client.wabaToken}` } }
+    );
+    const mediaUrl = mediaInfo.data.url;
+
+    // Step 2: Download the actual audio file (binary)
+    const audioResponse = await axios.get(mediaUrl, {
+      headers: { Authorization: `Bearer ${client.wabaToken}` },
+      responseType: 'arraybuffer',
+    });
+
+    // Step 3: Save to a temp file (Groq SDK needs a file stream)
+    tempFilePath = path.join(os.tmpdir(), `voice-${Date.now()}.ogg`);
+    fs.writeFileSync(tempFilePath, audioResponse.data);
+
+    // Step 4: Send to Groq Whisper for transcription (FREE)
+    const transcription = await groq.audio.transcriptions.create({
+      file: fs.createReadStream(tempFilePath),
+      model: 'whisper-large-v3-turbo',
+    });
+
+    return transcription.text;
+
+  } catch (err) {
+    console.error('❌ Audio transcription error:', err.response?.data || err.message);
+    return null;
+  } finally {
+    // Clean up temp file
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
   }
 }
 
@@ -185,7 +224,6 @@ async function notifyOwner(client, customerPhone, messages) {
 
 // ============================================================
 // OWNER ADMIN COMMANDS
-// Owner texts these from their personal number to bot number
 // ============================================================
 async function handleOwnerCommand(client, text) {
   const cmd  = text.trim().toLowerCase();
@@ -193,19 +231,16 @@ async function handleOwnerCommand(client, text) {
   const tok  = client.wabaToken;
   const owner = client.ownerPhone;
 
-  // !on — turn bot ON
   if (cmd === '!on') {
     botState[pid] = true;
     await sendMessage(pid, tok, owner,
       `🟢 Bot is now ON for ${client.businessName}.\nCustomers will receive bot replies.`);
 
-  // !off — turn bot OFF
   } else if (cmd === '!off') {
     botState[pid] = false;
     await sendMessage(pid, tok, owner,
       `🔴 Bot is now OFF for ${client.businessName}.\nCustomers will get no reply until you turn it back on.`);
 
-  // !status — check current state
   } else if (cmd === '!status') {
     const status  = isBotActive(pid) ? '🟢 ON' : '🔴 OFF';
     const bypassed = client.bypassNumbers.length > 0
@@ -216,7 +251,6 @@ async function handleOwnerCommand(client, text) {
       `Status: ${status}\n` +
       `Bypassed numbers: ${bypassed}`);
 
-  // !reply NUMBER message — send manual message to customer
   } else if (text.trim().toLowerCase().startsWith('!reply ')) {
     const parts = text.trim().split(' ');
     const customerNumber = parts[1];
@@ -230,7 +264,6 @@ async function handleOwnerCommand(client, text) {
 
     await sendMessage(pid, tok, customerNumber, messageText);
 
-    // Save owner reply in session so bot has context later
     const session = getSession(pid, customerNumber);
     session.messages.push({
       role: 'assistant',
@@ -240,7 +273,6 @@ async function handleOwnerCommand(client, text) {
     await sendMessage(pid, tok, owner,
       `✅ Message sent to +${customerNumber}`);
 
-  // !help — show all commands
   } else if (cmd === '!help') {
     await sendMessage(pid, tok, owner,
       `📋 *Available Commands:*\n\n` +
@@ -250,7 +282,6 @@ async function handleOwnerCommand(client, text) {
       `!reply 91XXXXXXXXXX message → Send message to customer\n` +
       `!help → Show this list`);
 
-  // Unknown command
   } else {
     await sendMessage(pid, tok, owner,
       `❓ Unknown command. Type *!help* to see all commands.`);
@@ -263,7 +294,6 @@ async function handleOwnerCommand(client, text) {
 async function handleMessage(client, customerPhone, userText) {
   const session = getSession(client.phoneNumberId, customerPhone);
 
-  // Allow customer to restart conversation
   if (['restart', 'cancel', 'reset'].includes(userText.toLowerCase())) {
     resetSession(client.phoneNumberId, customerPhone);
     await sendMessage(client.phoneNumberId, client.wabaToken, customerPhone,
@@ -287,7 +317,6 @@ async function handleMessage(client, customerPhone, userText) {
     const botReply = response.choices[0].message.content;
     session.messages.push({ role: 'assistant', content: botReply });
 
-    // Supports both trigger words with and without brackets
     const isComplete =
       botReply.includes('[ORDER_COMPLETE]') ||
       botReply.includes('[LEAD_CAPTURED]')  ||
@@ -361,9 +390,25 @@ app.post('/webhook', async (req, res) => {
     } else if (message.type === 'image' || message.type === 'document') {
       userText = `Customer sent a ${message.type}.`;
 
-      // Forward the actual file to owner for review (security)
       const mediaId = message[message.type].id;
       await forwardMediaToOwner(client, from, mediaId, message.type);
+
+    } else if (message.type === 'audio' || message.type === 'voice') {
+      // ✅ Transcribe voice note using Groq Whisper (free)
+      const mediaId = message[message.type].id;
+      console.log(`🎤 [${client.businessName}] Transcribing voice note from +${from}...`);
+
+      const transcribed = await transcribeAudio(client, mediaId);
+
+      if (transcribed && transcribed.trim()) {
+        userText = transcribed.trim();
+        console.log(`📝 [${client.businessName}] Transcribed: ${userText}`);
+      } else {
+        // Transcription failed — let customer know
+        await sendMessage(client.phoneNumberId, client.wabaToken, from,
+          '🙏 Sorry, I could not understand the voice message. Could you please type your message?');
+        return;
+      }
 
     } else {
       return;
