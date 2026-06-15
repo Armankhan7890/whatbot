@@ -84,21 +84,43 @@ function isBotActive(phoneNumberId) {
 
 // ============================================================
 // SESSION STORE
+// session = {
+//   messages: [],
+//   lastActivity: timestamp,
+//   notified: false        -> owner already notified for this session
+// }
 // ============================================================
 const sessions = {};
 
 function getSession(phoneNumberId, customerPhone) {
   if (!sessions[phoneNumberId]) sessions[phoneNumberId] = {};
   if (!sessions[phoneNumberId][customerPhone]) {
-    sessions[phoneNumberId][customerPhone] = { messages: [] };
+    sessions[phoneNumberId][customerPhone] = {
+      messages: [],
+      lastActivity: Date.now(),
+      notified: false,
+    };
   }
   return sessions[phoneNumberId][customerPhone];
 }
 
 function resetSession(phoneNumberId, customerPhone) {
   if (sessions[phoneNumberId]) {
-    sessions[phoneNumberId][customerPhone] = { messages: [] };
+    sessions[phoneNumberId][customerPhone] = {
+      messages: [],
+      lastActivity: Date.now(),
+      notified: false,
+    };
   }
+}
+
+// ============================================================
+// PHONE NUMBER DETECTION
+// Matches Indian 10-digit numbers, with or without +91/91 prefix
+// ============================================================
+function containsPhoneNumber(text) {
+  const regex = /(?:\+?91[\s-]?)?[6-9]\d{9}\b/;
+  return regex.test(text.replace(/\s+/g, ''));
 }
 
 // ============================================================
@@ -162,29 +184,24 @@ async function forwardMediaToOwner(client, customerPhone, mediaId, mediaType) {
 
 // ============================================================
 // DOWNLOAD MEDIA FROM META AND TRANSCRIBE WITH GROQ WHISPER
-// Returns the transcribed text from a voice note
 // ============================================================
 async function transcribeAudio(client, mediaId) {
   let tempFilePath;
   try {
-    // Step 1: Get the temporary media URL from Meta
     const mediaInfo = await axios.get(
       `https://graph.facebook.com/v18.0/${mediaId}`,
       { headers: { Authorization: `Bearer ${client.wabaToken}` } }
     );
     const mediaUrl = mediaInfo.data.url;
 
-    // Step 2: Download the actual audio file (binary)
     const audioResponse = await axios.get(mediaUrl, {
       headers: { Authorization: `Bearer ${client.wabaToken}` },
       responseType: 'arraybuffer',
     });
 
-    // Step 3: Save to a temp file (Groq SDK needs a file stream)
     tempFilePath = path.join(os.tmpdir(), `voice-${Date.now()}.ogg`);
     fs.writeFileSync(tempFilePath, audioResponse.data);
 
-    // Step 4: Send to Groq Whisper for transcription (FREE)
     const transcription = await groq.audio.transcriptions.create({
       file: fs.createReadStream(tempFilePath),
       model: 'whisper-large-v3-turbo',
@@ -196,7 +213,6 @@ async function transcribeAudio(client, mediaId) {
     console.error('❌ Audio transcription error:', err.response?.data || err.message);
     return null;
   } finally {
-    // Clean up temp file
     if (tempFilePath && fs.existsSync(tempFilePath)) {
       fs.unlinkSync(tempFilePath);
     }
@@ -204,22 +220,29 @@ async function transcribeAudio(client, mediaId) {
 }
 
 // ============================================================
-// NOTIFY OWNER
+// NOTIFY OWNER — sends full conversation transcript
+// reason: 'order_complete' | 'phone_detected' | 'idle_timeout'
 // ============================================================
-async function notifyOwner(client, customerPhone, messages) {
+async function notifyOwner(client, customerPhone, messages, reason = 'order_complete') {
   const recentChat = messages
-    .slice(-12)
+    .slice(-20)
     .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Bot'}: ${m.content}`)
     .join('\n');
 
+  const headers = {
+    order_complete: `🔔 *NEW LEAD — ${client.businessName}*`,
+    phone_detected: `📞 *NUMBER SHARED — ${client.businessName}*\n_(Order not fully confirmed yet, but customer shared their number)_`,
+    idle_timeout:   `⏳ *INACTIVE CHAT — ${client.businessName}*\n_(No reply from customer in a while, here's the conversation so far)_`,
+  };
+
   const msg =
-    `🔔 *NEW LEAD — ${client.businessName}*\n\n` +
+    `${headers[reason] || headers.order_complete}\n\n` +
     `📱 Customer: +${customerPhone}\n` +
     `⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n\n` +
-    `📋 *Full Conversation:*\n\n${recentChat}`;
+    `📋 *Conversation:*\n\n${recentChat}`;
 
   await sendMessage(client.phoneNumberId, client.wabaToken, client.ownerPhone, msg);
-  console.log(`✅ Owner notified [${client.businessName}] — customer: +${customerPhone}`);
+  console.log(`✅ Owner notified [${client.businessName}] (${reason}) — customer: +${customerPhone}`);
 }
 
 // ============================================================
@@ -302,6 +325,16 @@ async function handleMessage(client, customerPhone, userText) {
   }
 
   session.messages.push({ role: 'user', content: userText });
+  session.lastActivity = Date.now();
+
+  // ✅ SAFETY NET 1 — Customer shared a phone number
+  // Notify owner immediately, even if AI never says ORDER_COMPLETE later.
+  // Does NOT reset session — conversation continues normally.
+  if (!session.notified && containsPhoneNumber(userText)) {
+    session.notified = true; // mark so idle-timeout / order-complete won't duplicate
+    notifyOwner(client, customerPhone, session.messages, 'phone_detected')
+      .catch(err => console.error('Notify error:', err.message));
+  }
 
   try {
     const response = await groq.chat.completions.create({
@@ -316,6 +349,7 @@ async function handleMessage(client, customerPhone, userText) {
 
     const botReply = response.choices[0].message.content;
     session.messages.push({ role: 'assistant', content: botReply });
+    session.lastActivity = Date.now();
 
     const isComplete =
       botReply.includes('[ORDER_COMPLETE]') ||
@@ -333,7 +367,9 @@ async function handleMessage(client, customerPhone, userText) {
     await sendMessage(client.phoneNumberId, client.wabaToken, customerPhone, cleanReply);
 
     if (isComplete) {
-      await notifyOwner(client, customerPhone, session.messages);
+      // Always send the final full transcript on order complete,
+      // even if a "phone_detected" notification was already sent earlier.
+      await notifyOwner(client, customerPhone, session.messages, 'order_complete');
       resetSession(client.phoneNumberId, customerPhone);
     }
 
@@ -343,6 +379,37 @@ async function handleMessage(client, customerPhone, userText) {
       '🙏 Sorry, technical issue. Please try again in a moment.');
   }
 }
+
+// ============================================================
+// SAFETY NET 2 — IDLE CONVERSATION CHECKER
+// Runs every 2 minutes. If a session has real conversation
+// (3+ messages), hasn't been notified yet, and has been idle
+// for 5+ minutes, send the transcript to the owner anyway.
+// ============================================================
+const IDLE_CHECK_INTERVAL = 2 * 60 * 1000;   // check every 2 minutes
+const IDLE_THRESHOLD      = 5 * 60 * 1000;   // 5 minutes of no activity
+
+setInterval(() => {
+  const now = Date.now();
+
+  for (const phoneNumberId of Object.keys(sessions)) {
+    const client = CLIENTS[phoneNumberId];
+    if (!client) continue;
+
+    for (const customerPhone of Object.keys(sessions[phoneNumberId])) {
+      const session = sessions[phoneNumberId][customerPhone];
+
+      const hasRealConversation = session.messages.length >= 3;
+      const isIdle = (now - session.lastActivity) > IDLE_THRESHOLD;
+
+      if (hasRealConversation && isIdle && !session.notified) {
+        session.notified = true;
+        notifyOwner(client, customerPhone, session.messages, 'idle_timeout')
+          .catch(err => console.error('Idle notify error:', err.message));
+      }
+    }
+  }
+}, IDLE_CHECK_INTERVAL);
 
 // ============================================================
 // WEBHOOK VERIFICATION
@@ -394,7 +461,6 @@ app.post('/webhook', async (req, res) => {
       await forwardMediaToOwner(client, from, mediaId, message.type);
 
     } else if (message.type === 'audio' || message.type === 'voice') {
-      // ✅ Transcribe voice note using Groq Whisper (free)
       const mediaId = message[message.type].id;
       console.log(`🎤 [${client.businessName}] Transcribing voice note from +${from}...`);
 
@@ -404,7 +470,6 @@ app.post('/webhook', async (req, res) => {
         userText = transcribed.trim();
         console.log(`📝 [${client.businessName}] Transcribed: ${userText}`);
       } else {
-        // Transcription failed — let customer know
         await sendMessage(client.phoneNumberId, client.wabaToken, from,
           '🙏 Sorry, I could not understand the voice message. Could you please type your message?');
         return;
